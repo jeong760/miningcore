@@ -1,34 +1,14 @@
-/*
-Copyright 2017 Coin Foundry (coinfoundry.org)
-Authors: Oliver Weichhold (oliver@weichhold.com)
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
-associated documentation files (the "Software"), to deal in the Software without restriction,
-including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense,
-and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so,
-subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial
-portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
-LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
-WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-*/
-
-using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Net.Http;
-using System.Threading;
-using System.Threading.Tasks;
+using System.Collections.Concurrent;
+using System.Reactive.Concurrency;
+using System.Reactive.Disposables;
+using System.Reactive.Linq;
 using Autofac;
 using Autofac.Features.Metadata;
+using Microsoft.Extensions.Hosting;
 using Miningcore.Configuration;
 using Miningcore.Extensions;
 using Miningcore.Messaging;
+using Miningcore.Mining;
 using Miningcore.Notifications.Messages;
 using Miningcore.Persistence;
 using Miningcore.Persistence.Model;
@@ -36,253 +16,274 @@ using Miningcore.Persistence.Repositories;
 using NLog;
 using Contract = Miningcore.Contracts.Contract;
 
-namespace Miningcore.Payments
+namespace Miningcore.Payments;
+
+/// <summary>
+/// Coin agnostic payment processor
+/// </summary>
+public class PayoutManager : BackgroundService
 {
-    /// <summary>
-    /// Coin agnostic payment processor
-    /// </summary>
-    public class PayoutManager
+    public PayoutManager(IComponentContext ctx,
+        IConnectionFactory cf,
+        IBlockRepository blockRepo,
+        IShareRepository shareRepo,
+        IBalanceRepository balanceRepo,
+        ClusterConfig clusterConfig,
+        IMessageBus messageBus)
     {
-        public PayoutManager(IComponentContext ctx,
-            IConnectionFactory cf,
-            IBlockRepository blockRepo,
-            IShareRepository shareRepo,
-            IBalanceRepository balanceRepo,
-            IMessageBus messageBus)
-        {
-            Contract.RequiresNonNull(ctx, nameof(ctx));
-            Contract.RequiresNonNull(cf, nameof(cf));
-            Contract.RequiresNonNull(blockRepo, nameof(blockRepo));
-            Contract.RequiresNonNull(shareRepo, nameof(shareRepo));
-            Contract.RequiresNonNull(balanceRepo, nameof(balanceRepo));
-            Contract.RequiresNonNull(messageBus, nameof(messageBus));
+        Contract.RequiresNonNull(ctx);
+        Contract.RequiresNonNull(cf);
+        Contract.RequiresNonNull(blockRepo);
+        Contract.RequiresNonNull(shareRepo);
+        Contract.RequiresNonNull(balanceRepo);
+        Contract.RequiresNonNull(messageBus);
 
-            this.ctx = ctx;
-            this.cf = cf;
-            this.blockRepo = blockRepo;
-            this.shareRepo = shareRepo;
-            this.balanceRepo = balanceRepo;
-            this.messageBus = messageBus;
+        this.ctx = ctx;
+        this.cf = cf;
+        this.blockRepo = blockRepo;
+        this.shareRepo = shareRepo;
+        this.balanceRepo = balanceRepo;
+        this.messageBus = messageBus;
+        this.clusterConfig = clusterConfig;
+
+        interval = TimeSpan.FromSeconds(clusterConfig.PaymentProcessing.Interval > 0 ?
+            clusterConfig.PaymentProcessing.Interval : 600);
+    }
+
+    private static readonly ILogger logger = LogManager.GetCurrentClassLogger();
+    private readonly IBalanceRepository balanceRepo;
+    private readonly IBlockRepository blockRepo;
+    private readonly IConnectionFactory cf;
+    private readonly IComponentContext ctx;
+    private readonly IShareRepository shareRepo;
+    private readonly IMessageBus messageBus;
+    private readonly TimeSpan interval;
+    private readonly ConcurrentDictionary<string, IMiningPool> pools = new();
+    private readonly ClusterConfig clusterConfig;
+    private readonly CompositeDisposable disposables = new();
+
+#if !DEBUG
+    private static readonly TimeSpan initialRunDelay = TimeSpan.FromMinutes(1);
+#else
+    private static readonly TimeSpan initialRunDelay = TimeSpan.FromSeconds(15);
+#endif
+
+    private void AttachPool(IMiningPool pool)
+    {
+        pools.TryAdd(pool.Config.Id, pool);
+    }
+
+    private void OnPoolStatusNotification(PoolStatusNotification notification)
+    {
+        if(notification.Status == PoolStatus.Online)
+            AttachPool(notification.Pool);
+    }
+
+    private async Task ProcessPoolsAsync(CancellationToken ct)
+    {
+        foreach(var pool in pools.Values.ToArray().Where(x => x.Config.Enabled && x.Config.PaymentProcessing.Enabled))
+        {
+            var poolConfig = pool.Config;
+
+            logger.Info(() => $"Processing payments for pool {poolConfig.Id}");
+
+            try
+            {
+                var family = HandleFamilyOverride(poolConfig.Template.Family, poolConfig);
+
+                // resolve payout handler
+                var handlerImpl = ctx.Resolve<IEnumerable<Meta<Lazy<IPayoutHandler, CoinFamilyAttribute>>>>()
+                    .First(x => x.Value.Metadata.SupportedFamilies.Contains(family)).Value;
+
+                var handler = handlerImpl.Value;
+                await handler.ConfigureAsync(clusterConfig, poolConfig, ct);
+
+                // resolve payout scheme
+                var scheme = ctx.ResolveKeyed<IPayoutScheme>(poolConfig.PaymentProcessing.PayoutScheme);
+
+                await UpdatePoolBalancesAsync(pool, poolConfig, handler, scheme, ct);
+                await PayoutPoolBalancesAsync(pool, poolConfig, handler, ct);
+            }
+
+            catch(InvalidOperationException ex)
+            {
+                logger.Error(ex.InnerException ?? ex, () => $"[{poolConfig.Id}] Payment processing failed");
+            }
+
+            catch(AggregateException ex)
+            {
+                switch(ex.InnerException)
+                {
+                    case HttpRequestException httpEx:
+                        logger.Error(() => $"[{poolConfig.Id}] Payment processing failed: {httpEx.Message}");
+                        break;
+
+                    default:
+                        logger.Error(ex.InnerException, () => $"[{poolConfig.Id}] Payment processing failed");
+                        break;
+                }
+            }
+
+            catch(Exception ex)
+            {
+                logger.Error(ex, () => $"[{poolConfig.Id}] Payment processing failed");
+            }
+        }
+    }
+
+    private static CoinFamily HandleFamilyOverride(CoinFamily family, PoolConfig pool)
+    {
+        switch(family)
+        {
+            case CoinFamily.Equihash:
+                var equihashTemplate = pool.Template.As<EquihashCoinTemplate>();
+
+                if(equihashTemplate.UseBitcoinPayoutHandler)
+                    return CoinFamily.Bitcoin;
+
+                break;
         }
 
-        private readonly IBalanceRepository balanceRepo;
-        private readonly IBlockRepository blockRepo;
-        private readonly IConnectionFactory cf;
-        private readonly IComponentContext ctx;
-        private readonly IShareRepository shareRepo;
-        private readonly IMessageBus messageBus;
-        private readonly CancellationTokenSource cts = new CancellationTokenSource();
-        private TimeSpan interval;
-        private ClusterConfig clusterConfig;
-        private static readonly ILogger logger = LogManager.GetCurrentClassLogger();
+        return family;
+    }
 
-        private async Task ProcessPoolsAsync()
+    private async Task UpdatePoolBalancesAsync(IMiningPool pool, PoolConfig poolConfig, IPayoutHandler handler, IPayoutScheme scheme, CancellationToken ct)
+    {
+        // get pending blockRepo for pool
+        var pendingBlocks = await cf.Run(con => blockRepo.GetPendingBlocksForPoolAsync(con, poolConfig.Id));
+
+        // classify
+        var updatedBlocks = await handler.ClassifyBlocksAsync(pool, pendingBlocks, ct);
+
+        if(updatedBlocks.Any())
         {
-            foreach(var pool in clusterConfig.Pools.Where(x => x.Enabled && x.PaymentProcessing.Enabled))
+            foreach(var block in updatedBlocks.OrderBy(x => x.Created))
             {
-                logger.Info(() => $"Processing payments for pool {pool.Id}");
+                logger.Info(() => $"Processing payments for pool {poolConfig.Id}, block {block.BlockHeight}");
 
-                try
+                await cf.RunTx(async (con, tx) =>
                 {
-                    var family = HandleFamilyOverride(pool.Template.Family, pool);
+                    if(!block.Effort.HasValue)  // fill block effort if empty
+                        await CalculateBlockEffortAsync(pool, poolConfig, block, handler, ct);
 
-                    // resolve payout handler
-                    var handlerImpl = ctx.Resolve<IEnumerable<Meta<Lazy<IPayoutHandler, CoinFamilyAttribute>>>>()
-                        .First(x => x.Value.Metadata.SupportedFamilies.Contains(family)).Value;
-
-                    var handler = handlerImpl.Value;
-                    await handler.ConfigureAsync(clusterConfig, pool);
-
-                    // resolve payout scheme
-                    var scheme = ctx.ResolveKeyed<IPayoutScheme>(pool.PaymentProcessing.PayoutScheme);
-
-                    await UpdatePoolBalancesAsync(pool, handler, scheme);
-                    await PayoutPoolBalancesAsync(pool, handler);
-                }
-
-                catch(InvalidOperationException ex)
-                {
-                    logger.Error(ex.InnerException ?? ex, () => $"[{pool.Id}] Payment processing failed");
-                }
-
-                catch(AggregateException ex)
-                {
-                    switch(ex.InnerException)
+                    switch(block.Status)
                     {
-                        case HttpRequestException httpEx:
-                            logger.Error(() => $"[{pool.Id}] Payment processing failed: {httpEx.Message}");
+                        case BlockStatus.Confirmed:
+                            // blockchains that do not support block-reward payments via coinbase Tx
+                            // must generate balance records for all reward recipients instead
+                            var blockReward = await handler.UpdateBlockRewardBalancesAsync(con, tx, pool, block, ct);
+
+                            await scheme.UpdateBalancesAsync(con, tx, pool, handler, block, blockReward, ct);
+                            await blockRepo.UpdateBlockAsync(con, tx, block);
                             break;
 
-                        default:
-                            logger.Error(ex.InnerException, () => $"[{pool.Id}] Payment processing failed");
+                        case BlockStatus.Orphaned:
+                        case BlockStatus.Pending:
+                            await blockRepo.UpdateBlockAsync(con, tx, block);
                             break;
                     }
+                });
+            }
+        }
+
+        else
+            logger.Info(() => $"No updated blocks for pool {poolConfig.Id}");
+    }
+
+    private async Task PayoutPoolBalancesAsync(IMiningPool pool, PoolConfig config, IPayoutHandler handler, CancellationToken ct)
+    {
+        var poolBalancesOverMinimum = await cf.Run(con =>
+            balanceRepo.GetPoolBalancesOverThresholdAsync(con, config.Id, config.PaymentProcessing.MinimumPayment));
+
+        if(poolBalancesOverMinimum.Length > 0)
+        {
+            try
+            {
+                await handler.PayoutAsync(pool, poolBalancesOverMinimum, ct);
+            }
+
+            catch(Exception ex)
+            {
+                await NotifyPayoutFailureAsync(poolBalancesOverMinimum, config, ex);
+                throw;
+            }
+        }
+
+        else
+            logger.Info(() => $"No balances over configured minimum payout for pool {config.Id}");
+    }
+
+    private Task NotifyPayoutFailureAsync(Balance[] balances, PoolConfig pool, Exception ex)
+    {
+        messageBus.SendMessage(new PaymentNotification(pool.Id, ex.Message, balances.Sum(x => x.Amount), pool.Template.Symbol));
+
+        return Task.CompletedTask;
+    }
+
+    private async Task CalculateBlockEffortAsync(IMiningPool pool, PoolConfig poolConfig, Block block, IPayoutHandler handler, CancellationToken ct)
+    {
+        // get share date-range
+        var from = DateTime.MinValue;
+        var to = block.Created;
+
+        // get last block for pool
+        var lastBlock = await cf.Run(con => blockRepo.GetBlockBeforeAsync(con, poolConfig.Id, new[]
+        {
+            BlockStatus.Confirmed,
+            BlockStatus.Orphaned,
+            BlockStatus.Pending,
+        }, block.Created));
+
+        if(lastBlock != null)
+            from = lastBlock.Created;
+
+        block.Effort = await cf.Run(con =>
+            shareRepo.GetEffectiveAccumulatedShareDifficultyBetweenAsync(con, pool.Config.Id, from, to, ct));
+
+        if(block.Effort.HasValue)
+            block.Effort = handler.AdjustBlockEffort(block.Effort.Value);
+    }
+
+    protected override async Task ExecuteAsync(CancellationToken ct)
+    {
+        try
+        {
+            // monitor pool lifetime
+            disposables.Add(messageBus.Listen<PoolStatusNotification>()
+                .ObserveOn(TaskPoolScheduler.Default)
+                .Subscribe(OnPoolStatusNotification));
+
+            logger.Info(() => "Online");
+
+            // Allow all pools to actually come up before the first payment processing run
+            await Task.Delay(initialRunDelay, ct);
+
+            using var timer = new PeriodicTimer(interval);
+
+            do
+            {
+                try
+                {
+                    await ProcessPoolsAsync(ct);
+                }
+
+                catch(OperationCanceledException)
+                {
+                    // ignored
                 }
 
                 catch(Exception ex)
                 {
-                    logger.Error(ex, () => $"[{pool.Id}] Payment processing failed");
+                    logger.Error(ex);
                 }
-            }
+            } while(await timer.WaitForNextTickAsync(ct));
+
+            logger.Info(() => "Offline");
         }
 
-        private static CoinFamily HandleFamilyOverride(CoinFamily family, PoolConfig pool)
+        finally
         {
-            switch(family)
-            {
-                case CoinFamily.Equihash:
-                    var equihashTemplate = pool.Template.As<EquihashCoinTemplate>();
-
-                    if(equihashTemplate.UseBitcoinPayoutHandler)
-                        return CoinFamily.Bitcoin;
-
-                    break;
-            }
-
-            return family;
+            disposables.Dispose();
         }
-
-        private async Task UpdatePoolBalancesAsync(PoolConfig pool, IPayoutHandler handler, IPayoutScheme scheme)
-        {
-            // get pending blockRepo for pool
-            var pendingBlocks = await cf.Run(con => blockRepo.GetPendingBlocksForPoolAsync(con, pool.Id));
-
-            // classify
-            var updatedBlocks = await handler.ClassifyBlocksAsync(pendingBlocks);
-
-            if(updatedBlocks.Any())
-            {
-                foreach(var block in updatedBlocks.OrderBy(x => x.Created))
-                {
-                    logger.Info(() => $"Processing payments for pool {pool.Id}, block {block.BlockHeight}");
-
-                    await cf.RunTx(async (con, tx) =>
-                    {
-                        if(!block.Effort.HasValue)  // fill block effort if empty
-                            await CalculateBlockEffortAsync(pool, block, handler);
-
-                        switch(block.Status)
-                        {
-                            case BlockStatus.Confirmed:
-                                // blockchains that do not support block-reward payments via coinbase Tx
-                                // must generate balance records for all reward recipients instead
-                                var blockReward = await handler.UpdateBlockRewardBalancesAsync(con, tx, block, pool);
-
-                                await scheme.UpdateBalancesAsync(con, tx, pool, handler, block, blockReward);
-                                await blockRepo.UpdateBlockAsync(con, tx, block);
-                                break;
-
-                            case BlockStatus.Orphaned:
-                            case BlockStatus.Pending:
-                                await blockRepo.UpdateBlockAsync(con, tx, block);
-                                break;
-                        }
-                    });
-                }
-            }
-
-            else
-                logger.Info(() => $"No updated blocks for pool {pool.Id}");
-        }
-
-        private async Task PayoutPoolBalancesAsync(PoolConfig pool, IPayoutHandler handler)
-        {
-            var poolBalancesOverMinimum = await cf.Run(con =>
-                balanceRepo.GetPoolBalancesOverThresholdAsync(con, pool.Id, pool.PaymentProcessing.MinimumPayment));
-
-            if(poolBalancesOverMinimum.Length > 0)
-            {
-                try
-                {
-                    await handler.PayoutAsync(poolBalancesOverMinimum);
-                }
-
-                catch(Exception ex)
-                {
-                    await NotifyPayoutFailureAsync(poolBalancesOverMinimum, pool, ex);
-                    throw;
-                }
-            }
-
-            else
-                logger.Info(() => $"No balances over configured minimum payout for pool {pool.Id}");
-        }
-
-        private Task NotifyPayoutFailureAsync(Balance[] balances, PoolConfig pool, Exception ex)
-        {
-            messageBus.SendMessage(new PaymentNotification(pool.Id, ex.Message, balances.Sum(x => x.Amount), pool.Template.Symbol));
-
-            return Task.FromResult(true);
-        }
-
-        private async Task CalculateBlockEffortAsync(PoolConfig pool, Block block, IPayoutHandler handler)
-        {
-            // get share date-range
-            var from = DateTime.MinValue;
-            var to = block.Created;
-
-            // get last block for pool
-            var lastBlock = await cf.Run(con => blockRepo.GetBlockBeforeAsync(con, pool.Id, new[]
-            {
-                BlockStatus.Confirmed,
-                BlockStatus.Orphaned,
-                BlockStatus.Pending,
-            }, block.Created));
-
-            if(lastBlock != null)
-                from = lastBlock.Created;
-
-            // get combined diff of all shares for block
-            var accumulatedShareDiffForBlock = await cf.Run(con =>
-                shareRepo.GetAccumulatedShareDifficultyBetweenCreatedAsync(con, pool.Id, from, to));
-
-            // handler has the final say
-            if(accumulatedShareDiffForBlock.HasValue)
-                await handler.CalculateBlockEffortAsync(block, accumulatedShareDiffForBlock.Value);
-        }
-
-        #region API-Surface
-
-        public void Configure(ClusterConfig clusterConfig)
-        {
-            this.clusterConfig = clusterConfig;
-
-            interval = TimeSpan.FromSeconds(clusterConfig.PaymentProcessing.Interval > 0 ?
-                clusterConfig.PaymentProcessing.Interval : 600);
-        }
-
-        public void Start()
-        {
-            Task.Run(async () =>
-            {
-                logger.Info(() => "Online");
-
-                while(!cts.IsCancellationRequested)
-                {
-                    try
-                    {
-                        await ProcessPoolsAsync();
-                    }
-
-                    catch(Exception ex)
-                    {
-                        logger.Error(ex);
-                    }
-
-                    await Task.Delay(interval, cts.Token);
-                }
-            });
-        }
-
-        public void Stop()
-        {
-            logger.Info(() => "Stopping ..");
-
-            cts.Cancel();
-
-            logger.Info(() => "Stopped");
-        }
-
-        #endregion // API-Surface
     }
 }

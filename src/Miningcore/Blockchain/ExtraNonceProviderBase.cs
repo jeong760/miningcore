@@ -1,71 +1,86 @@
-/*
-Copyright 2017 Coin Foundry (coinfoundry.org)
-Authors: Oliver Weichhold (oliver@weichhold.com)
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
-associated documentation files (the "Software"), to deal in the Software without restriction,
-including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense,
-and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so,
-subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial
-portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
-LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
-WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-*/
-
-using System;
 using System.Security.Cryptography;
+using Miningcore.Mining;
+using Miningcore.Util;
+using NLog;
 
-namespace Miningcore.Blockchain
+namespace Miningcore.Blockchain;
+
+public class ExtraNonceProviderBase : IExtraNonceProvider
 {
-    public class ExtraNonceProviderBase : IExtraNonceProvider
+    protected ExtraNonceProviderBase(string poolId, int extranonceBytes, byte? instanceId)
     {
-        public ExtraNonceProviderBase(int extranonceBytes)
+        logger = LogUtil.GetPoolScopedLogger(GetType(), poolId);
+
+        this.extranonceBytes = extranonceBytes;
+        idShift = (extranonceBytes * 8) - IdBits;
+        nonceMax = (1UL << idShift) - 1;
+        idMax = (1U << IdBits) - 1;
+        stringFormat = "x" + extranonceBytes * 2;
+
+        // generate instanceId if not provided
+        var mask = (1L << IdBits) - 1;
+
+        if(instanceId.HasValue)
         {
-            this.extranonceBytes = extranonceBytes;
-            nonceMax = (1L << (extranonceBytes * 8)) - 1;
-            stringFormat = "x" + extranonceBytes * 2;
+            id = instanceId.Value;
 
-            uint instanceId;
+            if(id > idMax)
+                throw new PoolStartupException($"Provided instance id too large to fit into {IdBits} bits (limit {idMax})", poolId);
+        }
 
+        else
+        {
             using(var rng = RandomNumberGenerator.Create())
             {
-                var bytes = new byte[4];
+                var bytes = new byte[1];
                 rng.GetNonZeroBytes(bytes);
-                instanceId = BitConverter.ToUInt32(bytes, 0);
-            }
-
-            var mask = (1L << (extranonceBytes * 8)) - 1;
-            counter = Math.Abs(instanceId & mask);
-        }
-
-        private readonly object counterLock = new object();
-        protected long counter;
-        protected readonly int extranonceBytes;
-        protected readonly long nonceMax;
-        protected readonly string stringFormat;
-
-        #region IExtraNonceProvider
-
-        public string Next()
-        {
-            lock(counterLock)
-            {
-                counter++;
-                if(counter > nonceMax)
-                    counter = 0;
-
-                // encode to hex
-                var result = counter.ToString(stringFormat);
-                return result;
+                id = bytes[0];
             }
         }
 
-        #endregion // IExtraNonceProvider
+        id = (byte) (id & mask);
+        counter = 0;
+
+        logger.Info(()=> $"ExtraNonceProvider using {IdBits} bits for instance id, {extranonceBytes * 8 - IdBits} bits for {nonceMax} values, instance id = 0x{id:X}");
     }
+
+    private readonly ILogger logger;
+
+    private const int IdBits = 4;
+    private readonly object counterLock = new();
+    protected ulong counter;
+    protected byte id;
+    protected readonly int extranonceBytes;
+    protected readonly int idShift;
+    protected readonly uint idMax;
+    protected readonly ulong nonceMax;
+    protected readonly string stringFormat;
+
+    #region IExtraNonceProvider
+
+    public int ByteSize => extranonceBytes;
+
+    public string Next()
+    {
+        ulong value;
+
+        lock(counterLock)
+        {
+            counter++;
+
+            if(counter > nonceMax)
+            {
+                logger.Warn(()=> $"ExtraNonceProvider range exhausted! Rolling over to 0.");
+
+                counter = 0;
+            }
+
+            // encode to hex
+            value = ((ulong) id << idShift) | counter;
+        }
+
+        return value.ToString(stringFormat);
+    }
+
+    #endregion // IExtraNonceProvider
 }

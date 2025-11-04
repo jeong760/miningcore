@@ -15,25 +15,6 @@ WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN 
 SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 */
 
-#include <stdint.h>
-#include <string>
-#include <algorithm>
-
-#if defined(__ARM_ARCH)
-#include "xmrig/crypto/CryptoNight_arm.h"
-#else
-#include "xmrig/extra.h"
-#include "xmrig/crypto/CryptoNight_x86.h"
-#endif
-
-#include "xmrig/Mem.h"
-
-#if (defined(__AES__) && (__AES__ == 1)) || (defined(__ARM_FEATURE_CRYPTO) && (__ARM_FEATURE_CRYPTO == 1))
-#define SOFT_AES false
-#else
-// #warning Using software AES
-#define SOFT_AES true
-#endif
 
 #ifdef _WIN32
 #define MODULE_API __declspec(dllexport)
@@ -41,207 +22,196 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #define MODULE_API
 #endif
 
-#define STRINGISE_IMPL(x) #x
-#define STRINGISE(x) STRINGISE_IMPL(x)
+#include "crypto/common/VirtualMemory.h"
+#include "crypto/cn/CnCtx.h"
+#include "crypto/cn/CnHash.h"
+#include "crypto/astrobwt/AstroBWT.h"
+#include "crypto/kawpow/KPHash.h"
+#include "3rdparty/libethash/ethash.h"
+#include "crypto/ghostrider/ghostrider.h"
+#include "crypto/common/portable/mm_malloc.h"
 
-extern "C" MODULE_API cryptonight_ctx *cryptonight_alloc_context_export() {
-    cryptonight_ctx *ctx = NULL;
-	Mem::create(&ctx, xmrig::CRYPTONIGHT, 1);
+extern "C" {
+    #include "c29/portable_endian.h" // for htole32/64
+    #include "c29/int-util.h"
+}
 
+#include "c29.h"
+
+
+#if (defined(__AES__) && (__AES__ == 1)) || (defined(__ARM_FEATURE_CRYPTO) && (__ARM_FEATURE_CRYPTO == 1))
+#define SOFT_AES false
+#if defined(CPU_INTEL)
+//#warning Using IvyBridge assembler implementation
+#define ASM_TYPE xmrig::Assembly::INTEL
+#elif defined(CPU_AMD)
+#warning Using Ryzen assembler implementation
+#define ASM_TYPE xmrig::Assembly::RYZEN
+#elif defined(CPU_AMD_OLD)
+#warning Using Bulldozer assembler implementation
+#define ASM_TYPE xmrig::Assembly::BULLDOZER
+#elif !defined(__ARM_ARCH)
+#error Unknown ASM implementation!
+#endif
+#else
+//#warning Using software AES
+#define SOFT_AES true
+#endif
+
+#define FN(algo)  xmrig::CnHash::fn(xmrig::Algorithm::algo, SOFT_AES ? xmrig::CnHash::AV_SINGLE_SOFT : xmrig::CnHash::AV_SINGLE, xmrig::Assembly::NONE)
+#if defined(ASM_TYPE)
+#define FNA(algo) xmrig::CnHash::fn(xmrig::Algorithm::algo, SOFT_AES ? xmrig::CnHash::AV_SINGLE_SOFT : xmrig::CnHash::AV_SINGLE, ASM_TYPE)
+#else
+#define FNA(algo) xmrig::CnHash::fn(xmrig::Algorithm::algo, SOFT_AES ? xmrig::CnHash::AV_SINGLE_SOFT : xmrig::CnHash::AV_SINGLE, xmrig::Assembly::NONE)
+#endif
+
+constexpr size_t max_mem_size = 20 * 1024 * 1024;
+
+void ghostrider(const uint8_t* data, size_t size, uint8_t * output, cryptonight_ctx** ctx, uint64_t) {
+    xmrig::ghostrider::hash(data, size, output, ctx, nullptr);
+}
+
+static xmrig::cn_hash_fun get_cn_fn(const int algo) {
+    switch (algo) {
+    case xmrig::Algorithm::CN_0:  return FN(CN_0);
+    case xmrig::Algorithm::CN_1:  return FN(CN_1);
+    case xmrig::Algorithm::CN_FAST:  return FN(CN_FAST);
+    case xmrig::Algorithm::CN_XAO:  return FN(CN_XAO);
+    case xmrig::Algorithm::CN_RTO:  return FN(CN_RTO);
+    case xmrig::Algorithm::CN_2:  return FNA(CN_2);
+    case xmrig::Algorithm::CN_HALF:  return FNA(CN_HALF);
+    case xmrig::Algorithm::CN_GPU: return FN(CN_GPU);
+    case xmrig::Algorithm::CN_R: return FNA(CN_R);
+    case xmrig::Algorithm::CN_RWZ: return FNA(CN_RWZ);
+    case xmrig::Algorithm::CN_ZLS: return FNA(CN_ZLS);
+    case xmrig::Algorithm::CN_DOUBLE: return FNA(CN_DOUBLE);
+    case xmrig::Algorithm::CN_CCX: return FNA(CN_CCX);
+    case xmrig::Algorithm::GHOSTRIDER_RTM: return ghostrider;
+    default: return FN(CN_R);
+    }
+}
+
+static xmrig::cn_hash_fun get_cn_lite_fn(const int algo) {
+    switch (algo) {
+    case xmrig::Algorithm::CN_LITE_0:  return FN(CN_LITE_0);
+    case xmrig::Algorithm::CN_LITE_1:  return FN(CN_LITE_1);
+    default: return FN(CN_LITE_1);
+    }
+}
+
+static xmrig::cn_hash_fun get_cn_heavy_fn(const int algo) {
+    switch (algo) {
+    case xmrig::Algorithm::CN_HEAVY_0:  return FN(CN_HEAVY_0);
+    case xmrig::Algorithm::CN_HEAVY_XHV:  return FN(CN_HEAVY_XHV);
+    case xmrig::Algorithm::CN_HEAVY_TUBE:  return FN(CN_HEAVY_TUBE);
+    default: return FN(CN_HEAVY_0);
+    }
+}
+
+static xmrig::cn_hash_fun get_cn_pico_fn(const int algo) {
+    switch (algo) {
+    case xmrig::Algorithm::CN_HEAVY_TUBE:  return FNA(CN_PICO_0);
+    default: return FNA(CN_PICO_0);
+    }
+}
+static xmrig::cn_hash_fun get_argon2_fn(const int algo) {
+    switch (algo) {
+    case xmrig::Algorithm::AR2_CHUKWA:  return FN(AR2_CHUKWA);
+    case xmrig::Algorithm::AR2_WRKZ:  return FN(AR2_WRKZ);
+    case xmrig::Algorithm::AR2_CHUKWA_V2:  return FN(AR2_CHUKWA_V2);
+    default: return FN(AR2_CHUKWA);
+    }
+}
+
+extern "C" MODULE_API void *alloc_context_export()
+{
+    cryptonight_ctx* ctx = nullptr;
+    xmrig::CnCtx::create(&ctx, static_cast<uint8_t*>(_mm_malloc(max_mem_size, 4096)), max_mem_size, 1);
     return ctx;
 }
 
-extern "C" MODULE_API cryptonight_ctx *cryptonight_alloc_lite_context_export() {
-	cryptonight_ctx *ctx = NULL;
-	Mem::create(&ctx, xmrig::CRYPTONIGHT_LITE, 1);
-
-    return ctx;
-}
-
-extern "C" MODULE_API cryptonight_ctx *cryptonight_alloc_heavy_context_export() {
-	cryptonight_ctx *ctx = NULL;
-	Mem::create(&ctx, xmrig::CRYPTONIGHT_HEAVY, 1);
-
-    return ctx;
-}
-
-extern "C" MODULE_API cryptonight_ctx *cryptonight_alloc_pico_context_export() {
-	cryptonight_ctx *ctx = NULL;
-	Mem::create(&ctx, xmrig::CRYPTONIGHT_PICO, 1);
-
-	return ctx;
-}
-
-extern "C" MODULE_API void cryptonight_free_ctx_export(cryptonight_ctx *ctx) {
-	MemInfo mi;
-	Mem::release(&ctx, 1, mi);
-}
-
-extern "C" MODULE_API void cryptonight_export(cryptonight_ctx* ctx, const char* input, unsigned char *output, size_t inputSize, uint32_t variant, uint64_t height)
+extern "C" MODULE_API void free_context_export(cryptonight_ctx* ctx)
 {
-    switch (variant) {
-	case 0:  cryptonight_single_hash<xmrig::CRYPTONIGHT, SOFT_AES, xmrig::VARIANT_0>(reinterpret_cast<const uint8_t*>(input), inputSize, reinterpret_cast<uint8_t*>(output), &ctx, height);
-		break;
-	case 1:  cryptonight_single_hash<xmrig::CRYPTONIGHT, SOFT_AES, xmrig::VARIANT_1>(reinterpret_cast<const uint8_t*>(input), inputSize, reinterpret_cast<uint8_t*>(output), &ctx, height);
-		break;
-	case 3:  cryptonight_single_hash<xmrig::CRYPTONIGHT, SOFT_AES, xmrig::VARIANT_XTL>(reinterpret_cast<const uint8_t*>(input), inputSize, reinterpret_cast<uint8_t*>(output), &ctx, height);
-		break;
-	case 4:  cryptonight_single_hash<xmrig::CRYPTONIGHT, SOFT_AES, xmrig::VARIANT_MSR>(reinterpret_cast<const uint8_t*>(input), inputSize, reinterpret_cast<uint8_t*>(output), &ctx, height);
-		break;
-	case 6:  cryptonight_single_hash<xmrig::CRYPTONIGHT, SOFT_AES, xmrig::VARIANT_XAO>(reinterpret_cast<const uint8_t*>(input), inputSize, reinterpret_cast<uint8_t*>(output), &ctx, height);
-		break;
-	case 7:  cryptonight_single_hash<xmrig::CRYPTONIGHT, SOFT_AES, xmrig::VARIANT_RTO>(reinterpret_cast<const uint8_t*>(input), inputSize, reinterpret_cast<uint8_t*>(output), &ctx, height);
-		break;
-
-	case 8:
-#if !SOFT_AES && defined(CPU_INTEL)
-		// #warning Using IvyBridge assembler implementation
-			cryptonight_single_hash_asm<xmrig::CRYPTONIGHT, xmrig::VARIANT_2, xmrig::ASM_INTEL>(reinterpret_cast<const uint8_t*>(input), inputSize, reinterpret_cast<uint8_t*>(output), &ctx, height);
-#elif !SOFT_AES && defined(CPU_AMD)
-		// #warning Using Ryzen assembler implementation
-			cryptonight_single_hash_asm<xmrig::CRYPTONIGHT, xmrig::VARIANT_2, xmrig::ASM_RYZEN>(reinterpret_cast<const uint8_t*>(input), inputSize, reinterpret_cast<uint8_t*>(output), &ctx, height);
-#elif !SOFT_AES && defined(CPU_AMD_OLD)
-		// #warning Using Bulldozer assembler implementation
-			cryptonight_single_hash_asm<xmrig::CRYPTONIGHT, xmrig::VARIANT_2, xmrig::ASM_BULLDOZER>(reinterpret_cast<const uint8_t*>(input), inputSize, reinterpret_cast<uint8_t*>(output), &ctx, height);
-#else
-		cryptonight_single_hash    <xmrig::CRYPTONIGHT, SOFT_AES, xmrig::VARIANT_2>(reinterpret_cast<const uint8_t*>(input), inputSize, reinterpret_cast<uint8_t*>(output), &ctx, height);
-#endif
-		break;
-
-	case 9:
-#if !SOFT_AES && defined(CPU_INTEL)
-		// #warning Using IvyBridge assembler implementation
-			cryptonight_single_hash_asm<xmrig::CRYPTONIGHT, xmrig::VARIANT_HALF, xmrig::ASM_INTEL>(reinterpret_cast<const uint8_t*>(input), inputSize, reinterpret_cast<uint8_t*>(output), &ctx, height);
-#elif !SOFT_AES && defined(CPU_AMD)
-		// #warning Using Ryzen assembler implementation
-			cryptonight_single_hash_asm<xmrig::CRYPTONIGHT, xmrig::VARIANT_HALF, xmrig::ASM_RYZEN>(reinterpret_cast<const uint8_t*>(input), inputSize, reinterpret_cast<uint8_t*>(output), &ctx, height);
-#elif !SOFT_AES && defined(CPU_AMD_OLD)
-		// #warning Using Bulldozer assembler implementation
-			cryptonight_single_hash_asm<xmrig::CRYPTONIGHT, xmrig::VARIANT_HALF, xmrig::ASM_BULLDOZER>(reinterpret_cast<const uint8_t*>(input), inputSize, reinterpret_cast<uint8_t*>(output), &ctx, height);
-#else
-		cryptonight_single_hash    <xmrig::CRYPTONIGHT, SOFT_AES, xmrig::VARIANT_HALF>(reinterpret_cast<const uint8_t*>(input), inputSize, reinterpret_cast<uint8_t*>(output), &ctx, height);
-#endif
-		break;
-	case 11: cryptonight_single_hash_gpu<xmrig::CRYPTONIGHT, SOFT_AES, xmrig::VARIANT_GPU>(reinterpret_cast<const uint8_t*>(input), inputSize, reinterpret_cast<uint8_t*>(output), &ctx, height);
-		break;
-	case 12:
-		//if (!height_set) return THROW_ERROR_EXCEPTION("CryptonightR requires block template height as Argument 3");
-
-#if !SOFT_AES && (defined(CPU_INTEL) || defined(CPU_AMD))
-		cryptonight_single_hash_asm<xmrig::CRYPTONIGHT, xmrig::VARIANT_WOW, xmrig::ASM_AUTO>(reinterpret_cast<const uint8_t*>(input), inputSize, reinterpret_cast<uint8_t*>(output), &ctx, height);
-#else
-		cryptonight_single_hash    <xmrig::CRYPTONIGHT, SOFT_AES, xmrig::VARIANT_WOW>(reinterpret_cast<const uint8_t*>(input), inputSize, reinterpret_cast<uint8_t*>(output), &ctx, height);
-#endif
-		break;
-	case 13:
-		//if (!height_set) return THROW_ERROR_EXCEPTION("Cryptonight4 requires block template height as Argument 3");
-
-#if !SOFT_AES && defined(CPU_INTEL)
-		// #warning Using IvyBridge assembler implementation
-			cryptonight_single_hash_asm<xmrig::CRYPTONIGHT, xmrig::VARIANT_4, xmrig::ASM_INTEL>(reinterpret_cast<const uint8_t*>(input), inputSize, reinterpret_cast<uint8_t*>(output), &ctx, height);
-#elif !SOFT_AES && defined(CPU_AMD)
-		// #warning Using Ryzen assembler implementation
-			cryptonight_single_hash_asm<xmrig::CRYPTONIGHT, xmrig::VARIANT_4, xmrig::ASM_RYZEN>(reinterpret_cast<const uint8_t*>(input), inputSize, reinterpret_cast<uint8_t*>(output), &ctx, height);
-#elif !SOFT_AES && defined(CPU_AMD_OLD)
-		// #warning Using Bulldozer assembler implementation
-			cryptonight_single_hash_asm<xmrig::CRYPTONIGHT, xmrig::VARIANT_4, xmrig::ASM_BULLDOZER>(reinterpret_cast<const uint8_t*>(input), inputSize, reinterpret_cast<uint8_t*>(output), &ctx, height);
-#else
-		cryptonight_single_hash    <xmrig::CRYPTONIGHT, SOFT_AES, xmrig::VARIANT_4>(reinterpret_cast<const uint8_t*>(input), inputSize, reinterpret_cast<uint8_t*>(output), &ctx, height);
-#endif
-		break;
-
-	case 14:
-		cryptonight_single_hash<xmrig::CRYPTONIGHT, SOFT_AES, xmrig::VARIANT_RWZ>(reinterpret_cast<const uint8_t*>(input), inputSize, reinterpret_cast<uint8_t*>(output), &ctx, height);
-		break;
-
-	case 15:
-#if !SOFT_AES && defined(CPU_INTEL)
-		// #warning Using IvyBridge assembler implementation
-			cryptonight_single_hash_asm<xmrig::CRYPTONIGHT, xmrig::VARIANT_ZLS, xmrig::ASM_INTEL>(reinterpret_cast<const uint8_t*>(input), inputSize, reinterpret_cast<uint8_t*>(output), &ctx, height);
-#elif !SOFT_AES && defined(CPU_AMD)
-		// #warning Using Ryzen assembler implementation
-			cryptonight_single_hash_asm<xmrig::CRYPTONIGHT, xmrig::VARIANT_ZLS, xmrig::ASM_RYZEN>(reinterpret_cast<const uint8_t*>(input), inputSize, reinterpret_cast<uint8_t*>(output), &ctx, height);
-#elif !SOFT_AES && defined(CPU_AMD_OLD)
-		// #warning Using Bulldozer assembler implementation
-			cryptonight_single_hash_asm<xmrig::CRYPTONIGHT, xmrig::VARIANT_ZLS, xmrig::ASM_BULLDOZER>(reinterpret_cast<const uint8_t*>(input), inputSize, reinterpret_cast<uint8_t*>(output), &ctx, height);
-#else
-		cryptonight_single_hash    <xmrig::CRYPTONIGHT, SOFT_AES, xmrig::VARIANT_ZLS>(reinterpret_cast<const uint8_t*>(input), inputSize, reinterpret_cast<uint8_t*>(output), &ctx, height);
-#endif
-		break;
-
-	case 16:
-#if !SOFT_AES && defined(CPU_INTEL)
-		// #warning Using IvyBridge assembler implementation
-			cryptonight_single_hash_asm<xmrig::CRYPTONIGHT, xmrig::VARIANT_DOUBLE, xmrig::ASM_INTEL>(reinterpret_cast<const uint8_t*>(input), inputSize, reinterpret_cast<uint8_t*>(output), &ctx, height);
-#elif !SOFT_AES && defined(CPU_AMD)
-		// #warning Using Ryzen assembler implementation
-			cryptonight_single_hash_asm<xmrig::CRYPTONIGHT, xmrig::VARIANT_DOUBLE, xmrig::ASM_RYZEN>(reinterpret_cast<const uint8_t*>(input), inputSize, reinterpret_cast<uint8_t*>(output), &ctx, height);
-#elif !SOFT_AES && defined(CPU_AMD_OLD)
-		// #warning Using Bulldozer assembler implementation
-			cryptonight_single_hash_asm<xmrig::CRYPTONIGHT, xmrig::VARIANT_DOUBLE, xmrig::ASM_BULLDOZER>(reinterpret_cast<const uint8_t*>(input), inputSize, reinterpret_cast<uint8_t*>(output), &ctx, height);
-#else
-		cryptonight_single_hash    <xmrig::CRYPTONIGHT, SOFT_AES, xmrig::VARIANT_DOUBLE>(reinterpret_cast<const uint8_t*>(input), inputSize, reinterpret_cast<uint8_t*>(output), &ctx, height);
-#endif
-		break;
-
-	default: cryptonight_single_hash<xmrig::CRYPTONIGHT, SOFT_AES, xmrig::VARIANT_1>(reinterpret_cast<const uint8_t*>(input), inputSize, reinterpret_cast<uint8_t*>(output), &ctx, height);
-	}
+    if(ctx != nullptr)
+        xmrig::CnCtx::release(&ctx, 1);
 }
 
-extern "C" MODULE_API void cryptonight_light_export(cryptonight_ctx* ctx, const char* input, unsigned char *output, size_t inputSize, uint32_t variant, uint64_t height)
+extern "C" MODULE_API bool cryptonight_export(const uint8_t * input, size_t input_length,
+    char* output, const int algo, const uint64_t height, cryptonight_ctx* ctx)
 {
-    switch (variant) {
-	case 0:  
-		cryptonight_single_hash<xmrig::CRYPTONIGHT_LITE, SOFT_AES, xmrig::VARIANT_0>(reinterpret_cast<const uint8_t*>(input), inputSize, reinterpret_cast<uint8_t*>(output), &ctx, height);
-		break;
-	case 1:  
-		cryptonight_single_hash<xmrig::CRYPTONIGHT_LITE, SOFT_AES, xmrig::VARIANT_1>(reinterpret_cast<const uint8_t*>(input), inputSize, reinterpret_cast<uint8_t*>(output), &ctx, height);
-		break;
-	default: 
-		cryptonight_single_hash<xmrig::CRYPTONIGHT_LITE, SOFT_AES, xmrig::VARIANT_1>(reinterpret_cast<const uint8_t*>(input), inputSize, reinterpret_cast<uint8_t*>(output), &ctx, height);
-	}
+    if (input_length == 0)
+        return false;
+
+    if (ctx == nullptr || input == nullptr)
+        return false;
+
+    const xmrig::cn_hash_fun fn = get_cn_fn(algo);
+
+    fn(input, input_length, reinterpret_cast<uint8_t*>(output), &ctx, height);
+
+    return true;
 }
 
-extern "C" MODULE_API void cryptonight_heavy_export(cryptonight_ctx* ctx, const char* input, unsigned char *output, size_t inputSize, uint32_t variant, uint64_t height)
+extern "C" MODULE_API bool cryptonight_lite_export(const uint8_t * input, size_t input_length,
+    char* output, const int algo, const uint64_t height, cryptonight_ctx* ctx)
 {
-    switch (variant) {
-	case 0:  
-		cryptonight_single_hash<xmrig::CRYPTONIGHT_HEAVY, SOFT_AES, xmrig::VARIANT_0   >(reinterpret_cast<const uint8_t*>(input), inputSize, reinterpret_cast<uint8_t*>(output), &ctx, height);
-		break;
-	case 1:  
-		cryptonight_single_hash<xmrig::CRYPTONIGHT_HEAVY, SOFT_AES, xmrig::VARIANT_XHV >(reinterpret_cast<const uint8_t*>(input), inputSize, reinterpret_cast<uint8_t*>(output), &ctx, height);
-		break;
-	case 2:  
-		cryptonight_single_hash<xmrig::CRYPTONIGHT_HEAVY, SOFT_AES, xmrig::VARIANT_TUBE>(reinterpret_cast<const uint8_t*>(input), inputSize, reinterpret_cast<uint8_t*>(output), &ctx, height);
-		break;
-	default: 
-		cryptonight_single_hash<xmrig::CRYPTONIGHT_HEAVY, SOFT_AES, xmrig::VARIANT_0   >(reinterpret_cast<const uint8_t*>(input), inputSize, reinterpret_cast<uint8_t*>(output), &ctx, height);
-	}
+    if (input_length == 0)
+        return false;
+
+    if (ctx == nullptr || input == nullptr)
+        return false;
+
+    const xmrig::cn_hash_fun fn = get_cn_lite_fn(algo);
+
+    fn(input, input_length, reinterpret_cast<uint8_t*>(output), &ctx, height);
+
+    return true;
 }
 
-extern "C" MODULE_API void cryptonight_pico_export(cryptonight_ctx* ctx, const char* input, unsigned char *output, size_t inputSize, uint32_t variant, uint64_t height)
+extern "C" MODULE_API bool cryptonight_heavy_export(const uint8_t * input, size_t input_length,
+    char* output, const int algo, const uint64_t height, cryptonight_ctx* ctx)
 {
-	switch (variant) {
-	case 0:
-#if !SOFT_AES && defined(CPU_INTEL)
-		cryptonight_single_hash_asm<xmrig::CRYPTONIGHT_PICO, xmrig::VARIANT_TRTL, xmrig::ASM_INTEL>(reinterpret_cast<const uint8_t*>(input), inputSize, reinterpret_cast<uint8_t*>(output), &ctx, 0);
-#elif !SOFT_AES && defined(CPU_AMD)
-		cryptonight_single_hash_asm<xmrig::CRYPTONIGHT_PICO, xmrig::VARIANT_TRTL, xmrig::ASM_RYZEN>(reinterpret_cast<const uint8_t*>(input), inputSize, reinterpret_cast<uint8_t*>(output), &ctx, 0);
-#elif !SOFT_AES && defined(CPU_AMD_OLD)
-		cryptonight_single_hash_asm<xmrig::CRYPTONIGHT_PICO, xmrig::VARIANT_TRTL, xmrig::ASM_BULLDOZER>(reinterpret_cast<const uint8_t*>(input), inputSize, reinterpret_cast<uint8_t*>(output), &ctx, 0);
-#else
-		cryptonight_single_hash    <xmrig::CRYPTONIGHT_PICO, SOFT_AES, xmrig::VARIANT_TRTL>(reinterpret_cast<const uint8_t*>(input), inputSize, reinterpret_cast<uint8_t*>(output), &ctx, 0);
-#endif
-		break;
-	default:
-#if !SOFT_AES && defined(CPU_INTEL)
-		cryptonight_single_hash_asm<xmrig::CRYPTONIGHT_PICO, xmrig::VARIANT_TRTL, xmrig::ASM_INTEL>(reinterpret_cast<const uint8_t*>(input), inputSize, reinterpret_cast<uint8_t*>(output), &ctx, 0);
-#elif !SOFT_AES && defined(CPU_AMD)
-		cryptonight_single_hash_asm<xmrig::CRYPTONIGHT_PICO, xmrig::VARIANT_TRTL, xmrig::ASM_RYZEN>(reinterpret_cast<const uint8_t*>(input), inputSize, reinterpret_cast<uint8_t*>(output), &ctx, 0);
-#elif !SOFT_AES && defined(CPU_AMD_OLD)
-		cryptonight_single_hash_asm<xmrig::CRYPTONIGHT_PICO, xmrig::VARIANT_TRTL, xmrig::ASM_BULLDOZER>(reinterpret_cast<const uint8_t*>(input), inputSize, reinterpret_cast<uint8_t*>(output), &ctx, 0);
-#else
-		cryptonight_single_hash    <xmrig::CRYPTONIGHT_PICO, SOFT_AES, xmrig::VARIANT_TRTL>(reinterpret_cast<const uint8_t*>(input), inputSize, reinterpret_cast<uint8_t*>(output), &ctx, 0);
-#endif
-	}
+    if (input_length == 0)
+        return false;
+
+    if (ctx == nullptr || input == nullptr)
+        return false;
+
+    const xmrig::cn_hash_fun fn = get_cn_heavy_fn(algo);
+
+    fn(input, input_length, reinterpret_cast<uint8_t*>(output), &ctx, height);
+
+    return true;
+}
+
+extern "C" MODULE_API bool cryptonight_pico_export(const uint8_t * input, size_t input_length,
+    char* output, const int algo, const uint64_t height, cryptonight_ctx* ctx)
+{
+    if (input_length == 0)
+        return false;
+
+    if (ctx == nullptr || input == nullptr)
+        return false;
+
+    const xmrig::cn_hash_fun fn = get_cn_pico_fn(algo);
+
+    fn(input, input_length, reinterpret_cast<uint8_t*>(output), &ctx, height);
+
+    return true;
+}
+
+extern "C" MODULE_API bool argon_export(const uint8_t * input, size_t input_length,
+    char* output, const int algo, const uint64_t height, cryptonight_ctx* ctx)
+{
+    if (input_length == 0)
+        return false;
+
+    if (ctx == nullptr || input == nullptr)
+        return false;
+
+    const xmrig::cn_hash_fun fn = get_argon2_fn(algo);
+
+    fn(input, input_length, reinterpret_cast<uint8_t*>(output), &ctx, height);
+
+    return true;
 }

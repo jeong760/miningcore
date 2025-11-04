@@ -1,45 +1,24 @@
-/*
-Copyright 2017 Coin Foundry (coinfoundry.org)
-Authors: Oliver Weichhold (oliver@weichhold.com)
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
-associated documentation files (the "Software"), to deal in the Software without restriction,
-including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense,
-and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so,
-subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial
-portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
-LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
-WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-*/
-
 using System.Data;
-using System.Threading.Tasks;
 using Miningcore.Configuration;
+using Miningcore.Mining;
 using Miningcore.Persistence.Model;
 
-namespace Miningcore.Payments
+namespace Miningcore.Payments;
+
+public interface IPayoutHandler
 {
-    public interface IPayoutHandler
-    {
-        Task ConfigureAsync(ClusterConfig clusterConfig, PoolConfig poolConfig);
+    Task ConfigureAsync(ClusterConfig cc, PoolConfig pc, CancellationToken ct);
 
-        Task<Block[]> ClassifyBlocksAsync(Block[] blocks);
-        Task CalculateBlockEffortAsync(Block block, double accumulatedBlockShareDiff);
-        Task<decimal> UpdateBlockRewardBalancesAsync(IDbConnection con, IDbTransaction tx, Block block, PoolConfig pool);
-        Task PayoutAsync(Balance[] balances);
+    Task<Block[]> ClassifyBlocksAsync(IMiningPool pool, Block[] blocks, CancellationToken ct);
+    Task<decimal> UpdateBlockRewardBalancesAsync(IDbConnection con, IDbTransaction tx, IMiningPool pool, Block block, CancellationToken ct);
+    Task PayoutAsync(IMiningPool pool, Balance[] balances, CancellationToken ct);
+    double AdjustShareDifficulty(double difficulty);
+    double AdjustBlockEffort(double effort);
 
-        string FormatAmount(decimal amount);
-    }
+    string FormatAmount(decimal amount);
+}
 
-    public interface IPayoutScheme
-    {
-        Task UpdateBalancesAsync(IDbConnection con, IDbTransaction tx, PoolConfig poolConfig,
-            IPayoutHandler payoutHandler, Block block, decimal blockReward);
-    }
+public interface IPayoutScheme
+{
+    Task UpdateBalancesAsync(IDbConnection con, IDbTransaction tx, IMiningPool pool, IPayoutHandler payoutHandler, Block block, decimal blockReward, CancellationToken ct);
 }

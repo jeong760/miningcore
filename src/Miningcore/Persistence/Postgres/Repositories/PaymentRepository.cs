@@ -1,98 +1,127 @@
-/*
-Copyright 2017 Coin Foundry (coinfoundry.org)
-Authors: Oliver Weichhold (oliver@weichhold.com)
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
-associated documentation files (the "Software"), to deal in the Software without restriction,
-including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense,
-and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so,
-subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial
-portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
-LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
-WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-*/
-
 using System.Data;
-using System.Linq;
-using System.Threading.Tasks;
+using System.Text;
 using AutoMapper;
 using Dapper;
-using Miningcore.Extensions;
 using Miningcore.Persistence.Model;
 using Miningcore.Persistence.Model.Projections;
 using Miningcore.Persistence.Repositories;
-using NLog;
+using Npgsql;
+using NpgsqlTypes;
 
-namespace Miningcore.Persistence.Postgres.Repositories
+namespace Miningcore.Persistence.Postgres.Repositories;
+
+public class PaymentRepository : IPaymentRepository
 {
-    public class PaymentRepository : IPaymentRepository
+    public PaymentRepository(IMapper mapper)
     {
-        public PaymentRepository(IMapper mapper)
+        this.mapper = mapper;
+    }
+
+    private readonly IMapper mapper;
+
+    public async Task InsertAsync(IDbConnection con, IDbTransaction tx, Payment payment)
+    {
+        var mapped = mapper.Map<Entities.Payment>(payment);
+
+        const string query = @"INSERT INTO payments(poolid, coin, address, amount, transactionconfirmationdata, created)
+            VALUES(@poolid, @coin, @address, @amount, @transactionconfirmationdata, @created)";
+
+        await con.ExecuteAsync(query, mapped, tx);
+    }
+
+    public async Task BatchInsertAsync(IDbConnection con, IDbTransaction tx, IEnumerable<Payment> payments)
+    {
+        // NOTE: Even though the tx parameter is completely ignored here,
+        // the COPY command still honors a current ambient transaction
+
+        var pgCon = (NpgsqlConnection) con;
+
+        const string query = @"COPY payments (poolid, coin, address, amount, transactionconfirmationdata, created) FROM STDIN (FORMAT BINARY)";
+
+        await using(var writer = await pgCon.BeginBinaryImportAsync(query))
         {
-            this.mapper = mapper;
+            foreach(var payment in payments)
+            {
+                await writer.StartRowAsync();
+
+                await writer.WriteAsync(payment.PoolId);
+                await writer.WriteAsync(payment.Coin);
+                await writer.WriteAsync(payment.Address);
+                await writer.WriteAsync(payment.Amount, NpgsqlDbType.Numeric);
+                await writer.WriteAsync(payment.TransactionConfirmationData);
+                await writer.WriteAsync(payment.Created, NpgsqlDbType.Timestamp);
+            }
+
+            await writer.CompleteAsync();
         }
+    }
 
-        private readonly IMapper mapper;
-        private static readonly ILogger logger = LogManager.GetCurrentClassLogger();
+    public async Task<Payment[]> PagePaymentsAsync(IDbConnection con, string poolId, string address, int page, int pageSize, CancellationToken ct)
+    {
+        var query = new StringBuilder("SELECT * FROM payments WHERE poolid = @poolid ");
 
-        public async Task InsertAsync(IDbConnection con, IDbTransaction tx, Payment payment)
-        {
-            logger.LogInvoke();
+        if(!string.IsNullOrEmpty(address))
+            query.Append(" AND address = @address ");
 
-            var mapped = mapper.Map<Entities.Payment>(payment);
+        query.Append("ORDER BY created DESC OFFSET @offset FETCH NEXT @pageSize ROWS ONLY");
 
-            const string query = "INSERT INTO payments(poolid, coin, address, amount, transactionconfirmationdata, created) " +
-                "VALUES(@poolid, @coin, @address, @amount, @transactionconfirmationdata, @created)";
+        return (await con.QueryAsync<Entities.Payment>(new CommandDefinition(query.ToString(),
+                new { poolId, address, offset = page * pageSize, pageSize }, cancellationToken: ct)))
+            .Select(mapper.Map<Payment>)
+            .ToArray();
+    }
 
-            await con.ExecuteAsync(query, mapped, tx);
-        }
+    public async Task<BalanceChange[]> PageBalanceChangesAsync(IDbConnection con, string poolId, string address, int page, int pageSize, CancellationToken ct)
+    {
+       const string query = @"SELECT * FROM balance_changes WHERE poolid = @poolid
+            AND address = @address
+            ORDER BY created DESC OFFSET @offset FETCH NEXT @pageSize ROWS ONLY";
 
-        public async Task<Payment[]> PagePaymentsAsync(IDbConnection con, string poolId, string address, int page, int pageSize)
-        {
-            logger.LogInvoke(new[] { poolId });
+        return (await con.QueryAsync<Entities.BalanceChange>(new CommandDefinition(query,
+                new { poolId, address, offset = page * pageSize, pageSize }, cancellationToken: ct)))
+            .Select(mapper.Map<BalanceChange>)
+            .ToArray();
+    }
 
-            var query = "SELECT * FROM payments WHERE poolid = @poolid ";
+    public async Task<AmountByDate[]> PageMinerPaymentsByDayAsync(IDbConnection con, string poolId, string address, int page, int pageSize, CancellationToken ct)
+    {
+       const string query = @"SELECT SUM(amount) AS amount, date_trunc('day', created) AS date FROM payments WHERE poolid = @poolid
+            AND address = @address
+            GROUP BY date
+            ORDER BY date DESC OFFSET @offset FETCH NEXT @pageSize ROWS ONLY";
 
-            if(!string.IsNullOrEmpty(address))
-                query += " AND address = @address ";
+        return (await con.QueryAsync<AmountByDate>(new CommandDefinition(query, new { poolId, address, offset = page * pageSize, pageSize }, cancellationToken: ct)))
+            .ToArray();
+    }
 
-            query += "ORDER BY created DESC OFFSET @offset FETCH NEXT (@pageSize) ROWS ONLY";
+    public Task<uint> GetPaymentsCountAsync(IDbConnection con, string poolId, string address, CancellationToken ct)
+    {
+        var query = new StringBuilder("SELECT COUNT(*) FROM payments WHERE poolid = @poolId");
 
-            return (await con.QueryAsync<Entities.Payment>(query, new { poolId, address, offset = page * pageSize, pageSize }))
-                .Select(mapper.Map<Payment>)
-                .ToArray();
-        }
+        if(!string.IsNullOrEmpty(address))
+            query.Append(" AND address = @address ");
 
-        public async Task<BalanceChange[]> PageBalanceChangesAsync(IDbConnection con, string poolId, string address, int page, int pageSize)
-        {
-            logger.LogInvoke(new[] { poolId });
+        return con.ExecuteScalarAsync<uint>(new CommandDefinition(query.ToString(), new { poolId, address }, cancellationToken: ct));
+    }
 
-            const string query = "SELECT * FROM balance_changes WHERE poolid = @poolid " +
-                "AND address = @address " +
-                "ORDER BY created DESC OFFSET @offset FETCH NEXT (@pageSize) ROWS ONLY";
+    public Task<uint> GetMinerPaymentsByDayCountAsync(IDbConnection con, string poolId, string address)
+    {
+        const string query =
+            @"SELECT COUNT(*) FROM (SELECT SUM(amount) AS amount, date_trunc('day', created) AS date FROM payments WHERE poolid = @poolid
+            AND address = @address
+            GROUP BY date
+            ORDER BY date DESC) s";
 
-            return (await con.QueryAsync<Entities.BalanceChange>(query, new { poolId, address, offset = page * pageSize, pageSize }))
-                .Select(mapper.Map<BalanceChange>)
-                .ToArray();
-        }
+        return con.ExecuteScalarAsync<uint>(query, new { poolId, address });
+    }
 
-        public async Task<AmountByDate[]> PageMinerPaymentsByDayAsync(IDbConnection con, string poolId, string address, int page, int pageSize)
-        {
-            logger.LogInvoke(new[] { poolId });
+    public Task<uint> GetBalanceChangesCountAsync(IDbConnection con, string poolId, string address = null)
+    {
+        var query = new StringBuilder("SELECT COUNT(*) FROM balance_changes WHERE poolid = @poolId");
 
-            const string query = "SELECT SUM(amount) AS amount, date_trunc('day', created) AS date FROM payments WHERE poolid = @poolid " +
-                "AND address = @address " +
-                "GROUP BY date " +
-                "ORDER BY date DESC OFFSET @offset FETCH NEXT (@pageSize) ROWS ONLY";
+        if(!string.IsNullOrEmpty(address))
+            query.Append(" AND address = @address ");
 
-            return (await con.QueryAsync<AmountByDate>(query, new { poolId, address, offset = page * pageSize, pageSize }))
-                .ToArray();
-        }
+        return con.ExecuteScalarAsync<uint>(query.ToString(), new { poolId, address });
     }
 }

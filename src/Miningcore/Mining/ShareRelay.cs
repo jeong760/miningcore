@@ -1,157 +1,146 @@
-using System;
 using System.Collections.Concurrent;
-using System.IO;
 using System.Reactive.Concurrency;
 using System.Reactive.Linq;
+using Microsoft.Extensions.Hosting;
 using Miningcore.Blockchain;
 using Miningcore.Configuration;
 using Miningcore.Contracts;
 using Miningcore.Extensions;
 using Miningcore.Messaging;
-using Miningcore.Util;
-using Newtonsoft.Json;
 using NLog;
 using ProtoBuf;
 using ZeroMQ;
 
-namespace Miningcore.Mining
+namespace Miningcore.Mining;
+
+public class ShareRelay : IHostedService
 {
-    public class ShareRelay
+    public ShareRelay(ClusterConfig clusterConfig, IMessageBus messageBus)
     {
-        public ShareRelay(JsonSerializerSettings serializerSettings, IMessageBus messageBus)
-        {
-            Contract.RequiresNonNull(serializerSettings, nameof(serializerSettings));
-            Contract.RequiresNonNull(messageBus, nameof(messageBus));
+        Contract.RequiresNonNull(messageBus);
 
-            this.serializerSettings = serializerSettings;
-            this.messageBus = messageBus;
-        }
+        this.clusterConfig = clusterConfig;
+        this.messageBus = messageBus;
+    }
 
-        private readonly IMessageBus messageBus;
-        private ClusterConfig clusterConfig;
-        private readonly BlockingCollection<Share> queue = new BlockingCollection<Share>();
-        private IDisposable queueSub;
-        private readonly int QueueSizeWarningThreshold = 1024;
-        private bool hasWarnedAboutBacklogSize;
-        private ZSocket pubSocket;
-        private readonly JsonSerializerSettings serializerSettings;
+    private readonly IMessageBus messageBus;
+    private readonly ClusterConfig clusterConfig;
+    private readonly BlockingCollection<Share> queue = new();
+    private IDisposable queueSub;
+    private readonly int QueueSizeWarningThreshold = 1024;
+    private bool hasWarnedAboutBacklogSize;
+    private ZSocket pubSocket;
 
-        private static readonly ILogger logger = LogManager.GetCurrentClassLogger();
+    private static readonly ILogger logger = LogManager.GetCurrentClassLogger();
 
-        [Flags]
-        public enum WireFormat
-        {
-            Json = 1,
-            ProtocolBuffers = 2
-        }
+    [Flags]
+    public enum WireFormat
+    {
+        Json = 1,
+        ProtocolBuffers = 2
+    }
 
-        public const int WireFormatMask = 0xF;
+    public const int WireFormatMask = 0xF;
 
-        #region API-Surface
-
-        public void Start(ClusterConfig clusterConfig)
-        {
-            this.clusterConfig = clusterConfig;
-
-            messageBus.Listen<ClientShare>().Subscribe(x => queue.Add(x.Share));
-
-            pubSocket = new ZSocket(ZSocketType.PUB);
-
-            if(!clusterConfig.ShareRelay.Connect)
+    private void InitializeQueue()
+    {
+        queueSub = queue.GetConsumingEnumerable()
+            .ToObservable(TaskPoolScheduler.Default)
+            .Do(_ => CheckQueueBacklog())
+            .Subscribe(share =>
             {
-                pubSocket.SetupCurveTlsServer(clusterConfig.ShareRelay.SharedEncryptionKey, logger);
+                share.Source = clusterConfig.ClusterName;
+                share.BlockRewardDouble = (double) share.BlockReward;
 
-                pubSocket.Bind(clusterConfig.ShareRelay.PublishUrl);
-
-                if(pubSocket.CurveServer)
-                    logger.Info(() => $"Bound to {clusterConfig.ShareRelay.PublishUrl} using Curve public-key {pubSocket.CurvePublicKey.ToHexString()}");
-                else
-                    logger.Info(() => $"Bound to {clusterConfig.ShareRelay.PublishUrl}");
-            }
-
-            else
-            {
-                if(!string.IsNullOrEmpty(clusterConfig.ShareRelay.SharedEncryptionKey?.Trim()))
-                    logger.ThrowLogPoolStartupException("ZeroMQ Curve is not supported in ShareRelay Connect-Mode");
-
-                pubSocket.Connect(clusterConfig.ShareRelay.PublishUrl);
-                logger.Info(() => $"Connected to {clusterConfig.ShareRelay.PublishUrl}");
-            }
-
-            InitializeQueue();
-
-            logger.Info(() => "Online");
-        }
-
-        public void Stop()
-        {
-            logger.Info(() => "Stopping ..");
-
-            pubSocket.Dispose();
-
-            queueSub?.Dispose();
-            queueSub = null;
-
-            logger.Info(() => "Stopped");
-        }
-
-        #endregion // API-Surface
-
-        private void InitializeQueue()
-        {
-            queueSub = queue.GetConsumingEnumerable()
-                .ToObservable(TaskPoolScheduler.Default)
-                .Do(_ => CheckQueueBacklog())
-                .Subscribe(share =>
+                try
                 {
-                    share.Source = clusterConfig.ClusterName;
-                    share.BlockRewardDouble = (double) share.BlockReward;
+                    const int flags = (int) WireFormat.ProtocolBuffers;
 
-                    try
+                    using(var msg = new ZMessage())
                     {
-                        var flags = (int) WireFormat.ProtocolBuffers;
+                        // Topic frame
+                        msg.Add(new ZFrame(share.PoolId));
 
-                        using(var msg = new ZMessage())
+                        // Frame 2: flags
+                        msg.Add(new ZFrame(flags));
+
+                        // Frame 3: payload
+                        using(var stream = new MemoryStream())
                         {
-                            // Topic frame
-                            msg.Add(new ZFrame(share.PoolId));
-
-                            // Frame 2: flags
-                            msg.Add(new ZFrame(flags));
-
-                            // Frame 3: payload
-                            using(var stream = new MemoryStream())
-                            {
-                                Serializer.Serialize(stream, share);
-                                msg.Add(new ZFrame(stream.ToArray()));
-                            }
-
-                            pubSocket.SendMessage(msg);
+                            Serializer.Serialize(stream, share);
+                            msg.Add(new ZFrame(stream.ToArray()));
                         }
-                    }
 
-                    catch(Exception ex)
-                    {
-                        logger.Error(ex);
+                        pubSocket.SendMessage(msg);
                     }
-                });
-        }
-
-        private void CheckQueueBacklog()
-        {
-            if(queue.Count > QueueSizeWarningThreshold)
-            {
-                if(!hasWarnedAboutBacklogSize)
-                {
-                    logger.Warn(() => $"Share relay queue backlog has crossed {QueueSizeWarningThreshold}");
-                    hasWarnedAboutBacklogSize = true;
                 }
-            }
 
-            else if(hasWarnedAboutBacklogSize && queue.Count <= QueueSizeWarningThreshold / 2)
+                catch(Exception ex)
+                {
+                    logger.Error(ex);
+                }
+            });
+    }
+
+    private void CheckQueueBacklog()
+    {
+        if(queue.Count > QueueSizeWarningThreshold)
+        {
+            if(!hasWarnedAboutBacklogSize)
             {
-                hasWarnedAboutBacklogSize = false;
+                logger.Warn(() => $"Share relay queue backlog has crossed {QueueSizeWarningThreshold}");
+                hasWarnedAboutBacklogSize = true;
             }
         }
+
+        else if(hasWarnedAboutBacklogSize && queue.Count <= QueueSizeWarningThreshold / 2)
+        {
+            hasWarnedAboutBacklogSize = false;
+        }
+    }
+
+    public Task StartAsync(CancellationToken ct)
+    {
+        messageBus.Listen<StratumShare>().Subscribe(x => queue.Add(x.Share, ct));
+
+        pubSocket = new ZSocket(ZSocketType.PUB);
+
+        if(!clusterConfig.ShareRelay.Connect)
+        {
+            pubSocket.SetupCurveTlsServer(clusterConfig.ShareRelay.SharedEncryptionKey, logger);
+
+            pubSocket.Bind(clusterConfig.ShareRelay.PublishUrl);
+
+            if(pubSocket.CurveServer)
+                logger.Info(() => $"Bound to {clusterConfig.ShareRelay.PublishUrl} using key {pubSocket.CurvePublicKey.ToHexString()}");
+            else
+                logger.Info(() => $"Bound to {clusterConfig.ShareRelay.PublishUrl}");
+        }
+
+        else
+        {
+            if(!string.IsNullOrEmpty(clusterConfig.ShareRelay.SharedEncryptionKey?.Trim()))
+                throw new PoolStartupException("ZeroMQ Curve is not supported in ShareRelay Connect-Mode");
+
+            pubSocket.Connect(clusterConfig.ShareRelay.PublishUrl);
+
+            logger.Info(() => $"Connected to {clusterConfig.ShareRelay.PublishUrl}");
+        }
+
+        InitializeQueue();
+
+        logger.Info(() => "Online");
+
+        return Task.CompletedTask;
+    }
+
+    public Task StopAsync(CancellationToken ct)
+    {
+        pubSocket.Dispose();
+
+        queueSub?.Dispose();
+        queueSub = null;
+
+        return Task.CompletedTask;
     }
 }

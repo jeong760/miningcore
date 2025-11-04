@@ -1,35 +1,32 @@
-using System;
+namespace Miningcore.Blockchain.Ethereum;
 
-namespace Miningcore.Blockchain.Ethereum
+public static class EthereumUtils
 {
-    public class EthereumUtils
+    public static void DetectNetworkAndChain(string netVersionResponse, string gethChainResponse,
+        out EthereumNetworkType networkType, out GethChainType chainType)
     {
-        public static void DetectNetworkAndChain(string netVersionResponse, string parityChainResponse,
-            out EthereumNetworkType networkType, out ParityChainType chainType)
+        // convert network
+        if(int.TryParse(netVersionResponse, out var netWorkTypeInt))
         {
-            // convert network
-            if(int.TryParse(netVersionResponse, out var netWorkTypeInt))
-            {
-                networkType = (EthereumNetworkType) netWorkTypeInt;
+            networkType = (EthereumNetworkType) netWorkTypeInt;
 
-                if(!Enum.IsDefined(typeof(EthereumNetworkType), networkType))
-                    networkType = EthereumNetworkType.Unknown;
-            }
-
-            else
+            if(!Enum.IsDefined(typeof(EthereumNetworkType), networkType))
                 networkType = EthereumNetworkType.Unknown;
-
-            // convert chain
-            if(!Enum.TryParse(parityChainResponse, true, out chainType))
-            {
-                if(parityChainResponse.ToLower() == "ethereum classic")
-                    chainType = ParityChainType.Classic;
-                else
-                    chainType = ParityChainType.Unknown;
-            }
-
-            if(chainType == ParityChainType.Foundation)
-                chainType = ParityChainType.Mainnet;
         }
+
+        else
+            networkType = EthereumNetworkType.Unknown;
+
+        // convert chain
+        if(!Enum.TryParse(gethChainResponse, true, out chainType))
+        {
+            chainType = GethChainType.Unknown;
+        }
+
+        if(chainType == GethChainType.Main)
+            chainType = GethChainType.Main;
+
+        if(chainType == GethChainType.Callisto)
+            chainType = GethChainType.Callisto;
     }
 }

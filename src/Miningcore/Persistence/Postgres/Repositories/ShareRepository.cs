@@ -1,201 +1,146 @@
-/*
-Copyright 2017 Coin Foundry (coinfoundry.org)
-Authors: Oliver Weichhold (oliver@weichhold.com)
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
-associated documentation files (the "Software"), to deal in the Software without restriction,
-including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense,
-and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so,
-subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial
-portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
-LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
-WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-*/
-
-using System;
-using System.Collections.Generic;
 using System.Data;
-using System.Linq;
-using System.Threading.Tasks;
 using AutoMapper;
 using Dapper;
-using Miningcore.Extensions;
 using Miningcore.Persistence.Model;
 using Miningcore.Persistence.Model.Projections;
 using Miningcore.Persistence.Repositories;
-using Miningcore.Util;
-using NLog;
 using Npgsql;
 using NpgsqlTypes;
 
-namespace Miningcore.Persistence.Postgres.Repositories
+namespace Miningcore.Persistence.Postgres.Repositories;
+
+public class ShareRepository : IShareRepository
 {
-    public class ShareRepository : IShareRepository
+    public ShareRepository(IMapper mapper)
     {
-        public ShareRepository(IMapper mapper)
+        this.mapper = mapper;
+    }
+
+    private readonly IMapper mapper;
+
+    public async Task BatchInsertAsync(IDbConnection con, IDbTransaction tx, IEnumerable<Share> shares, CancellationToken ct)
+    {
+        // NOTE: Even though the tx parameter is completely ignored here,
+        // the COPY command still honors a current ambient transaction
+
+        var pgCon = (NpgsqlConnection) con;
+
+        const string query = @"COPY shares (poolid, blockheight, difficulty,
+            networkdifficulty, miner, worker, useragent, ipaddress, source, created) FROM STDIN (FORMAT BINARY)";
+
+        await using(var writer = await pgCon.BeginBinaryImportAsync(query, ct))
         {
-            this.mapper = mapper;
-        }
-
-        private readonly IMapper mapper;
-        private static readonly ILogger logger = LogManager.GetCurrentClassLogger();
-
-        public async Task InsertAsync(IDbConnection con, IDbTransaction tx, Share share)
-        {
-            logger.LogInvoke();
-
-            var mapped = mapper.Map<Entities.Share>(share);
-
-            const string query = "INSERT INTO shares(poolid, blockheight, difficulty, " +
-                "networkdifficulty, miner, worker, useragent, ipaddress, source, created) " +
-                "VALUES(@poolid, @blockheight, @difficulty, " +
-                "@networkdifficulty, @miner, @worker, @useragent, @ipaddress, @source, @created)";
-
-            await con.ExecuteAsync(query, mapped, tx);
-        }
-
-        public Task BatchInsertAsync(IDbConnection con, IDbTransaction tx, IEnumerable<Share> shares)
-        {
-            logger.LogInvoke();
-
-            // NOTE: Even though the tx parameter is completely ignored here,
-            // the COPY command still honors a current ambient transaction
-
-            var pgCon = (NpgsqlConnection) con;
-
-            const string query = "COPY shares (poolid, blockheight, difficulty, " +
-                "networkdifficulty, miner, worker, useragent, ipaddress, source, created) FROM STDIN (FORMAT BINARY)";
-
-            using(var writer = pgCon.BeginBinaryImport(query))
+            foreach(var share in shares)
             {
-                foreach(var share in shares)
-                {
-                    writer.StartRow();
+                await writer.StartRowAsync(ct);
 
-                    writer.Write(share.PoolId);
-                    writer.Write((long) share.BlockHeight, NpgsqlDbType.Bigint);
-                    writer.Write(share.Difficulty, NpgsqlDbType.Double);
-                    writer.Write(share.NetworkDifficulty, NpgsqlDbType.Double);
-                    writer.Write(share.Miner);
-                    writer.Write(share.Worker);
-                    writer.Write(share.UserAgent);
-                    writer.Write(share.IpAddress);
-                    writer.Write(share.Source);
-                    writer.Write(share.Created, NpgsqlDbType.Timestamp);
-                }
-
-                writer.Complete();
+                await writer.WriteAsync(share.PoolId, ct);
+                await writer.WriteAsync((long) share.BlockHeight, NpgsqlDbType.Bigint, ct);
+                await writer.WriteAsync(share.Difficulty, NpgsqlDbType.Double, ct);
+                await writer.WriteAsync(share.NetworkDifficulty, NpgsqlDbType.Double, ct);
+                await writer.WriteAsync(share.Miner, ct);
+                await writer.WriteAsync(share.Worker, ct);
+                await writer.WriteAsync(share.UserAgent, ct);
+                await writer.WriteAsync(share.IpAddress, ct);
+                await writer.WriteAsync(share.Source, ct);
+                await writer.WriteAsync(share.Created, NpgsqlDbType.TimestampTz, ct);
             }
 
-            return Task.FromResult(true);
+            await writer.CompleteAsync(ct);
         }
+    }
 
-        public async Task<Share[]> ReadSharesBeforeCreatedAsync(IDbConnection con, string poolId, DateTime before, bool inclusive, int pageSize)
-        {
-            logger.LogInvoke(new[] { poolId });
+    public async Task<Share[]> ReadSharesBeforeAsync(IDbConnection con, string poolId, DateTime before,
+        bool inclusive, int pageSize, CancellationToken ct)
+    {
+        var query = @$"SELECT * FROM shares WHERE poolid = @poolId AND created {(inclusive ? " <= " : " < ")} @before
+            ORDER BY created DESC FETCH NEXT @pageSize ROWS ONLY";
 
-            var query = $"SELECT * FROM shares WHERE poolid = @poolId AND created {(inclusive ? " <= " : " < ")} @before " +
-                "ORDER BY created DESC FETCH NEXT (@pageSize) ROWS ONLY";
+        return (await con.QueryAsync<Entities.Share>(new CommandDefinition(query, new { poolId, before, pageSize }, cancellationToken: ct)))
+            .Select(mapper.Map<Share>)
+            .ToArray();
+    }
 
-            return (await con.QueryAsync<Entities.Share>(query, new { poolId, before, pageSize }))
-                .Select(mapper.Map<Share>)
-                .ToArray();
-        }
+    public Task<long> CountSharesBeforeAsync(IDbConnection con, IDbTransaction tx, string poolId, DateTime before, CancellationToken ct)
+    {
+        const string query = "SELECT count(*) FROM shares WHERE poolid = @poolId AND created < @before";
 
-        public async Task<Share[]> ReadSharesBeforeAndAfterCreatedAsync(IDbConnection con, string poolId, DateTime before, DateTime after, bool inclusive, int pageSize)
-        {
-            logger.LogInvoke(new[] { poolId });
+        return con.QuerySingleAsync<long>(new CommandDefinition(query, new { poolId, before }, tx, cancellationToken: ct));
+    }
 
-            var query = $"SELECT * FROM shares WHERE poolid = @poolId AND created {(inclusive ? " <= " : " < ")} @before " +
-                $"AND created {(inclusive ? " >= " : " > ")} @after" +
-                "ORDER BY created DESC FETCH NEXT (@pageSize) ROWS ONLY";
+    public Task<long> CountSharesByMinerAsync(IDbConnection con, IDbTransaction tx, string poolId, string miner, CancellationToken ct)
+    {
+        const string query = "SELECT count(*) FROM shares WHERE poolid = @poolId AND miner = @miner";
 
-            return (await con.QueryAsync<Entities.Share>(query, new { poolId, before, after, pageSize }))
-                .Select(mapper.Map<Share>)
-                .ToArray();
-        }
+        return con.QuerySingleAsync<long>(new CommandDefinition(query, new { poolId, miner}, tx, cancellationToken: ct));
+    }
 
-        public async Task<Share[]> PageSharesBetweenCreatedAsync(IDbConnection con, string poolId, DateTime start, DateTime end, int page, int pageSize)
-        {
-            logger.LogInvoke(new[] { poolId });
+    public Task<double?> GetEffortBetweenCreatedAsync(IDbConnection con, string poolId, double shareConst, DateTime start, DateTime end)
+    {
+        const string query = "SELECT SUM((difficulty * @shareConst) / networkdifficulty) FROM shares WHERE poolid = @poolId AND created > @start AND created < @end";
 
-            var query = "SELECT * FROM shares WHERE poolid = @poolId AND created >= @start AND created <= @end " +
-                "ORDER BY created DESC OFFSET @offset FETCH NEXT (@pageSize) ROWS ONLY";
+        return con.QuerySingleAsync<double?>(query, new { poolId, shareConst, start, end });
+    }
 
-            return (await con.QueryAsync<Entities.Share>(query, new { poolId, start, end, offset = page * pageSize, pageSize }))
-                .Select(mapper.Map<Share>)
-                .ToArray();
-        }
+    public async Task DeleteSharesByMinerAsync(IDbConnection con, IDbTransaction tx, string poolId, string miner, CancellationToken ct)
+    {
+        const string query = "DELETE FROM shares WHERE poolid = @poolId AND miner = @miner";
 
-        public Task<long> CountSharesBeforeCreatedAsync(IDbConnection con, IDbTransaction tx, string poolId, DateTime before)
-        {
-            logger.LogInvoke(new[] { poolId });
+        await con.ExecuteAsync(new CommandDefinition(query, new { poolId, miner}, tx, cancellationToken: ct));
+    }
 
-            const string query = "SELECT count(*) FROM shares WHERE poolid = @poolId AND created < @before";
+    public async Task DeleteSharesBeforeAsync(IDbConnection con, IDbTransaction tx, string poolId, DateTime before, CancellationToken ct)
+    {
+        const string query = "DELETE FROM shares WHERE poolid = @poolId AND created < @before";
 
-            return con.QuerySingleAsync<long>(query, new { poolId, before }, tx);
-        }
+        await con.ExecuteAsync(new CommandDefinition(query, new { poolId, before }, tx, cancellationToken: ct));
+    }
 
-        public async Task DeleteSharesBeforeCreatedAsync(IDbConnection con, IDbTransaction tx, string poolId, DateTime before)
-        {
-            logger.LogInvoke(new[] { poolId });
+    public Task<double?> GetAccumulatedShareDifficultyBetweenAsync(IDbConnection con, string poolId, DateTime start, DateTime end, CancellationToken ct)
+    {
+        const string query = "SELECT SUM(difficulty) FROM shares WHERE poolid = @poolId AND created > @start AND created < @end";
 
-            const string query = "DELETE FROM shares WHERE poolid = @poolId AND created < @before";
+        return con.QuerySingleAsync<double?>(new CommandDefinition(query, new { poolId, start, end }, cancellationToken: ct));
+    }
 
-            await con.ExecuteAsync(query, new { poolId, before }, tx);
-        }
+    public Task<double?> GetEffectiveAccumulatedShareDifficultyBetweenAsync(IDbConnection con, string poolId, DateTime start, DateTime end, CancellationToken ct)
+    {
+        const string query = "SELECT SUM(difficulty / networkdifficulty) FROM shares WHERE poolid = @poolId AND created > @start AND created < @end";
 
-        public Task<long> CountSharesBetweenCreatedAsync(IDbConnection con, string poolId, string miner, DateTime? start, DateTime? end)
-        {
-            logger.LogInvoke(new[] { poolId });
+        return con.QuerySingleAsync<double?>(new CommandDefinition(query, new { poolId, start, end }, cancellationToken: ct));
+    }
 
-            var whereClause = "poolid = @poolId AND miner = @miner";
+    public async Task<MinerWorkerHashes[]> GetHashAccumulationBetweenAsync(IDbConnection con, string poolId, DateTime start, DateTime end, CancellationToken ct)
+    {
+        const string query = @"SELECT SUM(difficulty), COUNT(difficulty), MIN(created) AS firstshare, MAX(created) AS lastshare, miner, worker FROM shares
+            WHERE poolid = @poolId AND created >= @start AND created <= @end
+            GROUP BY miner, worker";
 
-            if(start.HasValue)
-                whereClause += " AND created >= @start ";
-            if(end.HasValue)
-                whereClause += " AND created <= @end";
+        return (await con.QueryAsync<MinerWorkerHashes>(new CommandDefinition(query, new { poolId, start, end }, cancellationToken: ct)))
+            .ToArray();
+    }
 
-            var query = $"SELECT count(*) FROM shares WHERE {whereClause}";
+    public async Task<KeyValuePair<string, double>[]> GetAccumulatedUserAgentShareDifficultyBetweenAsync(
+        IDbConnection con, string poolId, DateTime start, DateTime end, bool byVersion, CancellationToken ct)
+    {
+        const string query = @"SELECT SUM(difficulty) AS value, REGEXP_REPLACE(useragent, '/.+', '') AS key FROM shares
+                WHERE poolid = @poolId AND created > @start AND created < @end
+                GROUP BY key ORDER BY value DESC";
 
-            return con.QuerySingleAsync<long>(query, new { poolId, miner, start, end });
-        }
+        const string queryByVersion = @"SELECT SUM(difficulty) AS value, useragent AS key FROM shares
+            WHERE poolid = @poolId AND created > @start AND created < @end
+            GROUP BY key ORDER BY value DESC";
 
-        public Task<double?> GetAccumulatedShareDifficultyBetweenCreatedAsync(IDbConnection con, string poolId, DateTime start, DateTime end)
-        {
-            logger.LogInvoke(new[] { poolId });
+        return (await con.QueryAsync<KeyValuePair<string, double>>(new CommandDefinition(!byVersion ? query : queryByVersion, new { poolId, start, end }, cancellationToken: ct)))
+            .ToArray();
+    }
 
-            const string query = "SELECT SUM(difficulty) FROM shares WHERE poolid = @poolId AND created > @start AND created < @end";
+    public async Task<string[]> GetRecentyUsedIpAddressesAsync(IDbConnection con, IDbTransaction tx, string poolId, string miner, CancellationToken ct)
+    {
+        const string query = @"SELECT DISTINCT s.ipaddress FROM (SELECT * FROM shares
+            WHERE poolid = @poolId and miner = @miner ORDER BY CREATED DESC LIMIT 100) s";
 
-            return con.QuerySingleAsync<double?>(query, new { poolId, start, end });
-        }
-
-        public async Task<MinerWorkerHashes[]> GetAccumulatedShareDifficultyTotalAsync(IDbConnection con, string poolId)
-        {
-            logger.LogInvoke(new[] { (object) poolId });
-
-            const string query = "SELECT SUM(difficulty) AS sum, COUNT(difficulty) AS count, miner, worker FROM shares WHERE poolid = @poolid group by miner, worker";
-
-            return (await con.QueryAsync<MinerWorkerHashes>(query, new { poolId }))
-                .ToArray();
-        }
-
-        public async Task<MinerWorkerHashes[]> GetHashAccumulationBetweenCreatedAsync(IDbConnection con, string poolId, DateTime start, DateTime end)
-        {
-            logger.LogInvoke(new[] { poolId });
-
-            const string query = "SELECT SUM(difficulty), COUNT(difficulty), MIN(created) AS firstshare, MAX(created) AS lastshare, miner, worker FROM shares " +
-                "WHERE poolid = @poolId AND created >= @start AND created <= @end " +
-                "GROUP BY miner, worker";
-
-            return (await con.QueryAsync<MinerWorkerHashes>(query, new { poolId, start, end }))
-                .ToArray();
-        }
+        return (await con.QueryAsync<string>(new CommandDefinition(query, new { poolId, miner }, tx, cancellationToken: ct)))
+            .ToArray();
     }
 }

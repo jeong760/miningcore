@@ -1,47 +1,48 @@
-/* 
-Copyright 2017 Coin Foundry (coinfoundry.org)
-Authors: Oliver Weichhold (oliver@weichhold.com)
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and 
-associated documentation files (the "Software"), to deal in the Software without restriction, 
-including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, 
-and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, 
-subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial 
-portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT 
-LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. 
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, 
-WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE 
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-*/
-
-using System;
-using System.Collections.Generic;
+using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
+using Newtonsoft.Json.Serialization;
 
-namespace Miningcore.Extensions
+namespace Miningcore.Extensions;
+
+public static class SerializationExtensions
 {
-    public static class SerializationExtensions
+    private static readonly JsonSerializer serializer = new()
     {
-        public static T SafeExtensionDataAs<T>(this IDictionary<string, object> extra)
+        ContractResolver = new DefaultContractResolver
         {
-            if(extra != null)
-            {
-                try
-                {
-                    return JToken.FromObject(extra).ToObject<T>();
-                }
+            NamingStrategy = new CamelCaseNamingStrategy()
+        }
+    };
 
-                catch(Exception)
-                {
-                    // ignored
-                }
+    public static T SafeExtensionDataAs<T>(this IDictionary<string, object> extra, params string[] wrappers)
+    {
+        if(extra == null)
+            return default;
+
+        try
+        {
+            object o = extra;
+
+            foreach (var key in wrappers)
+            {
+                if(o is IDictionary<string, object> dict)
+                    o = dict[key];
+
+                else if(o is JObject jo)
+                    o = jo[key];
+
+                else
+                    throw new NotSupportedException("Unsupported child element type");
             }
 
-            return default(T);
+            return JToken.FromObject(o).ToObject<T>(serializer);
         }
+
+        catch
+        {
+            // ignored
+        }
+
+        return default;
     }
 }

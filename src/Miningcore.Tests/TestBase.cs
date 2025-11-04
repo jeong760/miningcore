@@ -1,18 +1,18 @@
-using System;
-using System.Collections.Generic;
-using System.IO;
-using System.Text;
-using Miningcore.Configuration;
+using Autofac;
+using Newtonsoft.Json;
 
-namespace Miningcore.Tests
+namespace Miningcore.Tests;
+
+public abstract class TestBase
 {
-    public abstract class TestBase
+    protected TestBase()
     {
-        protected Dictionary<string, CoinTemplate> coinTemplates;
+        ModuleInitializer.Initialize();
 
-        protected TestBase()
-        {
-            ModuleInitializer.Initialize();
-        }
+        container = ModuleInitializer.Container;
+        jsonSerializerSettings = container.Resolve<JsonSerializerSettings>();
     }
+
+    protected readonly IContainer container;
+    protected readonly JsonSerializerSettings jsonSerializerSettings;
 }
